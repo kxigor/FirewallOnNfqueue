@@ -10,15 +10,11 @@ void error_handler(const std::string_view &func_name,
                std::strerror(errid));
 }
 
-static int banned_words_handler(struct nfq_q_handle *gh, struct nfgenmsg *nfmsg,
-                                struct nfq_data *nfad, void *data) {
-  std::vector<std::string> banned_words = *((std::vector<std::string> *)data);
-}
-
 int main() {
-  std::vector<std::string> banned_words = {"C++"};
+  std::vector<std::string> banned_words = {"C++", "blockme", "HTML", "virus"};
   nfq::FirewallFactory::QueueConfig queue_config{
-      .handler = banned_words_handler, .user_data = (void *)&banned_words};
+      .handler = &nfq::FirewallFactory::banned_words_handler,
+      .user_data = (void *)&banned_words};
 
   nfq::FirewallFactory::FirewallConfig config;
   config.queues.emplace_back(queue_config);
@@ -28,7 +24,7 @@ int main() {
   firewall.start(error_handler);
 
   std::println("Press Q to exit");
-  while (getchar() != (int)'Q') { std::print("1");}
+  while (getchar() != (int)'Q');
 
   firewall.stop();
   std::cout << "GERRE\n";
