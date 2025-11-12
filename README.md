@@ -11,9 +11,9 @@ sudo env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" ./build/bin/app
 
 ## Требования
 + `C++23`
-+ 'g++ (GCC) 14.2.0'
-+ 'cmake 3.16'
-+ 'clang-tidy/format-19'
++ `g++ (GCC) 14.2.0`
++ `cmake 3.16`
++ `clang-tidy/format-19`
 + `libnetfilter_queue`
 
 ## Пример работы
