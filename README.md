@@ -59,5 +59,3 @@ MATCH: Filter applied. Src: 192.168.31.5 Protocol: 6. Action: DROP
 MATCH: Filter applied. Src: 192.168.31.5 Protocol: 6. Action: DROP
 
 ```
-
-![пример работы](assets/works.png)
