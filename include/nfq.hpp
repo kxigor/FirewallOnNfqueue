@@ -1,18 +1,39 @@
 #pragma once
 
+#include <arpa/inet.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #include <linux/ip.h>
 #include <linux/netfilter.h>
-#include <linux/tcp.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <sstream>
 #include <thread>
 #include <vector>
 
 namespace nfq {
+
+struct PacketFilter {
+  enum Action { ACCEPT, DROP };
+  Action action{DROP};
+
+  uint32_t src_ip{0};
+  uint32_t dst_ip{0};
+
+  uint16_t src_port{0};
+  uint16_t dst_port{0};
+
+  uint8_t tcp_flags_mask{0};
+  uint8_t tcp_flags_expected{0};
+
+  std::vector<std::string> banned_words;
+
+  uint8_t protocol{0};
+};
 
 class FirewallFactory {
  public:
@@ -46,9 +67,16 @@ class FirewallFactory {
     return nfq_set_verdict(qh, get_packet_id(nfad), NF_DROP, 0, NULL);
   }
 
-  static int banned_words_handler(struct nfq_q_handle *qh,
-                                  struct nfgenmsg *nfmsg, struct nfq_data *nfad,
-                                  void *data) {
+  static int generic_packet_handler(struct nfq_q_handle *qh,
+                                    struct nfgenmsg *nfmsg,
+                                    struct nfq_data *nfad, void *data) {
+    std::vector<PacketFilter> *filters =
+        static_cast<std::vector<PacketFilter> *>(data);
+
+    if (!filters || filters->empty()) {
+      return accept_packet(qh, nfad);
+    }
+
     unsigned char *packet_data;
     int packet_len = nfq_get_payload(nfad, &packet_data);
 
@@ -62,37 +90,90 @@ class FirewallFactory {
       return accept_packet(qh, nfad);
     }
 
-    if (iph->protocol != IPPROTO_TCP) {
-      return accept_packet(qh, nfad);
-    }
-
     int ip_header_len = iph->ihl * 4;
 
-    if (packet_len < ip_header_len + sizeof(struct tcphdr)) {
-      return accept_packet(qh, nfad);
+    struct tcphdr *tcph = nullptr;
+    unsigned char *app_data = nullptr;
+    int app_data_len = 0;
+
+    if (iph->protocol == IPPROTO_TCP) {
+      if (packet_len >= ip_header_len + sizeof(struct tcphdr)) {
+        tcph = (struct tcphdr *)(packet_data + ip_header_len);
+        int tcp_header_len = tcph->doff * 4;
+        int total_headers_len = ip_header_len + tcp_header_len;
+
+        if (packet_len > total_headers_len) {
+          app_data = packet_data + total_headers_len;
+          app_data_len = packet_len - total_headers_len;
+        }
+      }
     }
 
-    struct tcphdr *tcph = (struct tcphdr *)(packet_data + ip_header_len);
+    for (const auto &filter : *filters) {
+      bool match = true;
 
-    int tcp_header_len = tcph->doff * 4;
+      if (filter.protocol != 0 && filter.protocol != iph->protocol) {
+        match = false;
+      }
 
-    int total_headers_len = ip_header_len + tcp_header_len;
+      if (match && filter.src_ip != 0 && filter.src_ip != iph->saddr) {
+        match = false;
+      }
 
-    if (packet_len <= total_headers_len) {
-      return accept_packet(qh, nfad);
-    }
+      if (match && filter.dst_ip != 0 && filter.dst_ip != iph->daddr) {
+        match = false;
+      }
 
-    unsigned char *app_data = packet_data + total_headers_len;
-    int app_data_len = packet_len - total_headers_len;
+      if (match && iph->protocol == IPPROTO_TCP && tcph) {
+        if (filter.src_port != 0 && filter.src_port != ntohs(tcph->source)) {
+          match = false;
+        }
+        if (match && filter.dst_port != 0 &&
+            filter.dst_port != ntohs(tcph->dest)) {
+          match = false;
+        }
+        uint8_t actual_flags =
+            ((tcph->fin ? TH_FIN : 0) | (tcph->syn ? TH_SYN : 0) |
+             (tcph->rst ? TH_RST : 0) | (tcph->psh ? TH_PUSH : 0) |
+             (tcph->ack ? TH_ACK : 0) | (tcph->urg ? TH_URG : 0));
 
-    std::vector<std::string> banned_words = *((std::vector<std::string> *)data);
+        if (match && filter.tcp_flags_mask != 0) {
+          if ((actual_flags & filter.tcp_flags_mask) !=
+              filter.tcp_flags_expected) {
+            match = false;
+          }
+        }
+      }
 
-    std::string packet_content((char *)app_data, app_data_len);
+      if (match && !filter.banned_words.empty() && app_data) {
+        std::string packet_content((char *)app_data, app_data_len);
+        bool found_banned_word = false;
+        for (const auto &word : filter.banned_words) {
+          if (packet_content.find(word) != std::string::npos) {
+            found_banned_word = true;
+            break;
+          }
+        }
+        if (!found_banned_word) {
+          match = false;
+        }
+      } else if (match && !filter.banned_words.empty() && !app_data) {
+        match = false;
+      }
 
-    for (const auto &word : banned_words) {
-      if (packet_content.find(word) != std::string::npos) {
-        std::cout << "BLOCKED: Found banned word '" << word << "'" << std::endl;
-        return drop_packet(qh, nfad);
+      if (match) {
+        struct in_addr src_ip_addr;
+        src_ip_addr.s_addr = iph->saddr;
+        std::cout << "MATCH: Filter applied. Src: " << inet_ntoa(src_ip_addr)
+                  << " Protocol: " << (int)iph->protocol << ". Action: "
+                  << (filter.action == PacketFilter::DROP ? "DROP" : "ACCEPT")
+                  << std::endl;
+
+        if (filter.action == PacketFilter::DROP) {
+          return drop_packet(qh, nfad);
+        } else {
+          return accept_packet(qh, nfad);
+        }
       }
     }
 
@@ -137,10 +218,10 @@ class Firewall {
     }
 
     if (nfq_bind_pf(handle, config_.protocol_family) < 0) {
-      std::invoke(error_handler, "runner::nfq_bind_pf",
-                  std::format("can't nfq_bind_pf({}, {})", (void *)handle,
-                              config_.protocol_family),
-                  errno);
+      std::ostringstream ss;
+      ss << "can't nfq_bind_pf(" << (void *)handle << ", "
+         << config_.protocol_family << ")";
+      std::invoke(error_handler, "runner::nfq_bind_pf", ss.str(), errno);
       stop();
       return;
     }
@@ -150,18 +231,17 @@ class Firewall {
       nfq_q_handle *queue_handle =
           nfq_create_queue(handle, number, handler, user_data);
       if (queue_handle == nullptr) {
-        std::invoke(
-            error_handler, "runner::nfq_create_queue",
-            std::format("can't nfq_create_queue({}, {}, {}, {})",
-                        (void *)handle, number, (void *)handler, user_data),
-            errno);
+        std::ostringstream ss;
+        ss << "can't nfq_create_queue(" << (void *)handle << ", " << number
+           << ", " << (void *)handler << ", " << user_data << ")";
+        std::invoke(error_handler, "runner::nfq_create_queue", ss.str(), errno);
       }
 
       if (nfq_set_mode(queue_handle, mode, range) < 0) {
-        std::invoke(error_handler, "runner::nfq_set_mode",
-                    std::format("can't nfq_set_mode({}, {}, {})",
-                                (void *)queue_handle, mode, range),
-                    errno);
+        std::ostringstream ss;
+        ss << "can't nfq_set_mode(" << (void *)queue_handle << ", " << (int)mode
+           << ", " << range << ")";
+        std::invoke(error_handler, "runner::nfq_set_mode", ss.str(), errno);
         stop();
         return;
       }
